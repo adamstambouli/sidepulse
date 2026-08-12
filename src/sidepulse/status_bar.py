@@ -88,8 +88,14 @@ from .install import (
 )
 from .led_status import (
     AgentLedController,
+    CompletionAnnouncer,
+    FleetSlots,
+    announcement_may_show,
     apply_brightness,
     brightness_percent,
+    fleet_program,
+    fleet_bands_for_statuses,
+    fleet_visible_statuses,
     normalize_brightness,
     normalized_device_name,
     program_for_display_state,
@@ -136,6 +142,7 @@ from .settings import (
     CLOSED_LID_AWAKE_NEVER,
     LED_DISPLAY_AGENT,
     LED_DISPLAY_BATTERY,
+    LED_DISPLAY_FLEET,
     LID_ANIMATION_CLOSED,
     LID_ANIMATION_OPEN,
     LedAnimationSetting,
@@ -171,6 +178,7 @@ STATE_IDLE = StatusBarState("Idle", "circle", 4)
 STATE_WORKING = StatusBarState("Working", "arrow.triangle.2.circlepath", 2)
 STATE_DONE = StatusBarState("Done", "checkmark.circle", 3)
 STATE_ASK = StatusBarState("Ask", "questionmark.circle", 1)
+STATE_BLOCKED = StatusBarState("Blocked", "exclamationmark.triangle", 0)
 STATUS_BAR_DEVICE_PRIORITY = ("sidepulsepro", "sidepulsedot")
 STATUS_BAR_KEEPALIVE_VOLUME_NAMES = (
     "SidePulsePro",
@@ -193,8 +201,23 @@ CLOSED_LID_AWAKE_LABELS = {
 }
 
 
+def fleet_statuses_for_snapshot(snapshot) -> tuple[AgentStatus, ...]:
+    """Per-agent view: everything inside its visibility window.
+
+    `snapshot.statuses` exists to answer "what is active", so it drops
+    completions as soon as any agent is working. A per-agent display needs the
+    completions too, which is what fresh_statuses keeps.
+    """
+    if snapshot is None:
+        return ()
+    within_window = getattr(snapshot, "fresh_statuses", ()) or snapshot.statuses
+    return fleet_visible_statuses(within_window)
+
+
 def state_for_mode(mode: AgentMode) -> StatusBarState:
-    if mode in {AgentMode.WAITING_FOR_INPUT, AgentMode.BLOCKED_ERROR}:
+    if mode == AgentMode.BLOCKED_ERROR:
+        return STATE_BLOCKED
+    if mode == AgentMode.WAITING_FOR_INPUT:
         return STATE_ASK
     if mode in {
         AgentMode.WORKING,
@@ -266,6 +289,8 @@ class StatusBarController(NSObject):
         self.led_sync_in_flight = False
         self.last_led_error = None
         self.last_led_display_kind = LED_DISPLAY_AGENT
+        self.completion_announcer = CompletionAnnouncer()
+        self.virtual_fleet_slots = FleetSlots()
         self.last_connected_device_signature = None
         self.keep_awake = KeepAwakeController()
         self.closed_lid_awake = ClosedLidAwakeController(
@@ -321,6 +346,9 @@ class StatusBarController(NSObject):
         )
         self.show_setup_window_if_needed()
         if SCREEN_BAR_FEATURE_ENABLED and self.settings.virtual_status_device_enabled:
+            self.virtual_status_device.set_position(
+                self.settings.virtual_status_device_position
+            )
             self.virtual_status_device.show()
         else:
             self.virtual_status_device.hide()
@@ -339,16 +367,54 @@ class StatusBarController(NSObject):
 
         self.last_snapshot = snapshot
         battery_snapshot = self.read_battery_snapshot()
-        state = state_for_mode(snapshot.aggregate.mode)
+        display_mode = self.display_mode_for_snapshot(snapshot)
+        state = state_for_mode(display_mode)
         self.observe_connected_devices()
         self.set_status(state)
+        # Keep-awake follows the real aggregate, not the brief Done announcement.
         self.sync_keep_awake(snapshot.aggregate.mode)
         self.sync_leds(
-            snapshot.aggregate.mode,
+            display_mode,
             battery_snapshot,
             self.active_led_display_kind(battery_snapshot),
+            fleet_statuses_for_snapshot(snapshot),
         )
         self.status_item.setMenu_(build_menu(snapshot, state, self))
+
+    def display_mode_for_snapshot(self, snapshot) -> AgentMode:
+        """Briefly surface a completion the aggregate would otherwise hide.
+
+        Completed ranks below Working, so with parallel agents one long-runner
+        masks every completion. Hold Done for a few seconds when an agent
+        finishes, unless something is actually waiting on the user.
+        """
+        mode = snapshot.aggregate.mode
+        # Must watch fresh_statuses: `statuses` drops completions the moment
+        # another agent is active, so the announcer would never see the
+        # transition in exactly the case it exists for.
+        announcing = self.completion_announcer.observe(
+            fleet_statuses_for_snapshot(snapshot)
+        )
+        if self.completion_announcer.started:
+            self.schedule_completion_refresh()
+        if announcing and announcement_may_show(mode):
+            return AgentMode.COMPLETED
+        return mode
+
+    def schedule_completion_refresh(self) -> None:
+        """Refresh once more when the hold expires, so Done does not linger."""
+        if NSTimer is None:
+            return
+        try:
+            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                self.completion_announcer.hold_seconds + 0.2,
+                self,
+                "forceRefresh:",
+                None,
+                False,
+            )
+        except Exception as exc:  # pragma: no cover - AppKit scheduling only
+            log_status_bar(f"completion refresh schedule error: {exc}")
 
     @objc.IBAction
     def forceRefresh_(self, _sender):
@@ -518,6 +584,10 @@ class StatusBarController(NSObject):
     @objc.IBAction
     def setDeviceDisplayBattery_(self, sender):
         self.set_device_display(sender.representedObject(), LED_DISPLAY_BATTERY)
+
+    @objc.IBAction
+    def setDeviceDisplayFleet_(self, sender):
+        self.set_device_display(sender.representedObject(), LED_DISPLAY_FLEET)
 
     @objc.IBAction
     def setDeviceBrightness_(self, sender):
@@ -1000,6 +1070,7 @@ class StatusBarController(NSObject):
                 self.last_snapshot.aggregate.mode,
                 self.last_battery_snapshot,
                 self.active_led_display_kind(self.last_battery_snapshot),
+                fleet_statuses_for_snapshot(self.last_snapshot),
             )
 
     def set_virtual_status_device(self, enabled: bool) -> None:
@@ -1241,6 +1312,8 @@ class StatusBarController(NSObject):
             return LED_DISPLAY_BATTERY
         if snapshot is not None and time.monotonic() < self.battery_preview_until:
             return LED_DISPLAY_BATTERY
+        if self.settings.led_display == LED_DISPLAY_FLEET:
+            return LED_DISPLAY_FLEET
         return LED_DISPLAY_AGENT
 
     def reset_led_controllers_for_display_change(self) -> None:
@@ -1401,6 +1474,8 @@ class StatusBarController(NSObject):
             return LED_DISPLAY_BATTERY
         if battery_snapshot is not None and time.monotonic() < self.battery_preview_until:
             return LED_DISPLAY_BATTERY
+        if device.display == LED_DISPLAY_FLEET:
+            return LED_DISPLAY_FLEET
         return LED_DISPLAY_AGENT
 
     def sync_leds(
@@ -1408,11 +1483,12 @@ class StatusBarController(NSObject):
         mode: AgentMode,
         battery_snapshot: BatterySnapshot | None,
         display_kind: str,
+        statuses: tuple[AgentStatus, ...] = (),
     ) -> None:
         if not self.leds_enabled:
             return
 
-        self.sync_virtual_status_device(mode, battery_snapshot)
+        self.sync_virtual_status_device(mode, battery_snapshot, statuses)
 
         if time.monotonic() < self.led_animation_until_monotonic:
             return
@@ -1422,7 +1498,7 @@ class StatusBarController(NSObject):
         self.led_sync_in_flight = True
         thread = threading.Thread(
             target=self.sync_leds_worker,
-            args=(mode, battery_snapshot, display_kind),
+            args=(mode, battery_snapshot, display_kind, statuses),
             daemon=True,
         )
         thread.start()
@@ -1431,6 +1507,7 @@ class StatusBarController(NSObject):
         self,
         mode: AgentMode,
         battery_snapshot: BatterySnapshot | None,
+        statuses: tuple[AgentStatus, ...] = (),
     ) -> None:
         if not SCREEN_BAR_FEATURE_ENABLED:
             self.virtual_status_device.hide()
@@ -1455,6 +1532,18 @@ class StatusBarController(NSObject):
                     brightness=device.brightness,
                 )
             )
+        elif display == LED_DISPLAY_FLEET:
+            self.virtual_status_device.set_program(
+                fleet_program(
+                    fleet_bands_for_statuses(
+                        statuses,
+                        self.virtual_fleet_slots,
+                        led_count=8,
+                    ),
+                    led_count=8,
+                    brightness=device.brightness,
+                )
+            )
         else:
             self.virtual_status_device.set_program(
                 program_for_display_state(
@@ -1469,9 +1558,10 @@ class StatusBarController(NSObject):
         mode: AgentMode,
         battery_snapshot: BatterySnapshot | None,
         display_kind: str,
+        statuses: tuple[AgentStatus, ...] = (),
     ) -> None:
         try:
-            self.sync_leds_now(mode, battery_snapshot, display_kind)
+            self.sync_leds_now(mode, battery_snapshot, display_kind, statuses)
         finally:
             self.led_sync_in_flight = False
 
@@ -1480,6 +1570,7 @@ class StatusBarController(NSObject):
         mode: AgentMode,
         battery_snapshot: BatterySnapshot | None,
         display_kind: str,
+        statuses: tuple[AgentStatus, ...] = (),
     ) -> None:
         devices = [
             device for device in self.status_bar_devices()
@@ -1512,6 +1603,9 @@ class StatusBarController(NSObject):
                     f"{device.name} Battery {battery_snapshot.percent}% "
                     f"{format_watts(battery_snapshot.adapter_power)}"
                 )
+            elif device_display_kind == LED_DISPLAY_FLEET:
+                result = self.agent_controller_for_device(device).sync_fleet(statuses)
+                label = f"{device.name} Fleet {len(statuses)} {result.label}"
             else:
                 result = self.agent_controller_for_device(device).sync_mode(mode)
                 label = f"{device.name} {result.label}"
@@ -1875,6 +1969,16 @@ def build_device_menu_item(device: StatusBarDevice, target: StatusBarController)
     agent.setRepresentedObject_(device.device_id)
     agent.setState_(1 if device.display == LED_DISPLAY_AGENT else 0)
     submenu.addItem_(agent)
+
+    fleet = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Fleet (Split LEDs Per Agent)",
+        "setDeviceDisplayFleet:",
+        "",
+    )
+    fleet.setTarget_(target)
+    fleet.setRepresentedObject_(device.device_id)
+    fleet.setState_(1 if device.display == LED_DISPLAY_FLEET else 0)
+    submenu.addItem_(fleet)
 
     battery = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
         "Battery Level",

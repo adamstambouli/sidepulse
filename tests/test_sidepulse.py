@@ -58,8 +58,22 @@ from sidepulse.install import (
 from sidepulse.keep_awake import KeepAwakeController, status_file_for_target
 from sidepulse.led_status import (
     AgentLedController,
+    ASK_AMBER,
+    DONE_GREEN,
+    FLEET_PULSE_MS,
+    WORKING_BLUE,
+    CompletionAnnouncer,
+    FleetBand,
+    FleetSlots,
     LedDisplayState,
+    announcement_may_show,
+    fleet_visible_statuses,
+    relative_luminance,
+    scaled_to_luminance,
     display_state_for_mode,
+    fleet_program,
+    fleet_representative_state,
+    fleet_bands_for_statuses,
     led_count_for_target,
     program_for_display_state,
     write_mode_to_leds,
@@ -699,9 +713,36 @@ class AgentMonitorTests(unittest.TestCase):
         )
 
         self.assertFalse(virtual_device.screen_has_notch(screen))
+        # No notch to tuck under, so the band is the taller standalone height.
         self.assertEqual(
             virtual_device.virtual_window_frame_for_screen(screen),
-            ((850.0, 1075.0), (220.0, 5.0)),
+            ((850.0, 1066.0), (220.0, 14.0)),
+        )
+
+    def test_virtual_screen_bar_position_clears_a_desktop_webcam(self) -> None:
+        try:
+            from sidepulse import virtual_device
+        except (ImportError, SystemExit) as exc:
+            self.skipTest(str(exc))
+
+        frame = SimpleNamespace(
+            origin=SimpleNamespace(x=0.0, y=0.0),
+            size=SimpleNamespace(width=1920.0, height=1080.0),
+        )
+
+        # Centered is where a desktop camera sits, so left/right must clear it.
+        self.assertEqual(
+            virtual_device.window_x_for_position(frame, 220.0, "center"), 850.0
+        )
+        self.assertEqual(
+            virtual_device.window_x_for_position(frame, 220.0, "left"), 24.0
+        )
+        self.assertEqual(
+            virtual_device.window_x_for_position(frame, 220.0, "right"), 1676.0
+        )
+        # Unknown values fall back to centered rather than off-screen.
+        self.assertEqual(
+            virtual_device.window_x_for_position(frame, 220.0, "nonsense"), 850.0
         )
 
     def test_virtual_screen_bar_redraws_at_60fps(self) -> None:
@@ -1953,18 +1994,27 @@ class AgentMonitorTests(unittest.TestCase):
             display_state_for_mode(AgentMode.IDLE_READY),
             LedDisplayState.IDLE,
         )
+        self.assertEqual(
+            display_state_for_mode(AgentMode.BLOCKED_ERROR),
+            LedDisplayState.BLOCKED,
+        )
 
         self.assertEqual(
             program_for_display_state(LedDisplayState.IDLE),
             "off\n#020204 6s pulse\nrepeat",
         )
-        self.assertEqual(program_for_display_state(LedDisplayState.DONE), "#00FF66")
-        self.assertIn("#FF3A00 1.6s pulse", program_for_display_state(LedDisplayState.ASK))
+        self.assertEqual(program_for_display_state(LedDisplayState.DONE), "#004A1E")
+        self.assertIn("#855300 0.7s pulse", program_for_display_state(LedDisplayState.ASK))
+
+        # Blocked must be visually distinct from Ask, not just a shade of it.
+        blocked = program_for_display_state(LedDisplayState.BLOCKED)
+        self.assertIn("#FF0000 0.42s pulse", blocked)
+        self.assertNotEqual(blocked, program_for_display_state(LedDisplayState.ASK))
         self.assertEqual(
             program_for_display_state(LedDisplayState.WORKING, led_count=2).splitlines(),
             [
                 "off 160ms cosine",
-                "0:#00E5FF 760ms pulse 0ms; 1:#00E5FF 760ms pulse 260ms",
+                "0:#0033FF 1200ms pulse 0ms; 1:#0033FF 1200ms pulse 400ms",
                 "repeat",
             ],
         )
@@ -1974,7 +2024,7 @@ class AgentMonitorTests(unittest.TestCase):
         )
         self.assertEqual(
             program_for_display_state(LedDisplayState.DONE, brightness=128),
-            "brightness 128\n#00FF66",
+            "brightness 128\n#004A1E",
         )
 
     def test_write_mode_to_leds_uses_device_specific_program(self) -> None:
@@ -1989,7 +2039,7 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(
                 (device / "LEDS.LED").read_text(),
                 "off 160ms cosine\n"
-                "0:#00E5FF 760ms pulse 0ms; 1:#00E5FF 760ms pulse 260ms\n"
+                "0:#0033FF 1200ms pulse 0ms; 1:#0033FF 1200ms pulse 400ms\n"
                 "repeat",
             )
 
@@ -2002,7 +2052,7 @@ class AgentMonitorTests(unittest.TestCase):
 
             write_mode_to_leds(AgentMode.COMPLETED, device_path=device, brightness=64)
 
-            self.assertEqual((device / "LEDS.LED").read_text(), "brightness 64\n#00FF66")
+            self.assertEqual((device / "LEDS.LED").read_text(), "brightness 64\n#004A1E")
 
     def test_led_count_uses_product_name(self) -> None:
         self.assertEqual(led_count_for_target(Path("/Volumes/SidePulseDot/LEDS.LED")), 2)
@@ -2018,9 +2068,9 @@ class AgentMonitorTests(unittest.TestCase):
             lines = (device / "LEDS.LED").read_text().splitlines()
             self.assertEqual(len(lines), 3)
             self.assertEqual(lines[0], "off 160ms cosine")
-            self.assertIn("0:#00E5FF 760ms pulse 0ms", lines[1])
-            self.assertIn("5:#00E5FF 760ms pulse 475ms", lines[1])
-            self.assertIn("7:#00E5FF 760ms pulse 665ms", lines[1])
+            self.assertIn("0:#0033FF 1200ms pulse 0ms", lines[1])
+            self.assertIn("5:#0033FF 1200ms pulse 700ms", lines[1])
+            self.assertIn("7:#0033FF 1200ms pulse 980ms", lines[1])
             self.assertEqual(lines[-1], "repeat")
 
     def test_agent_led_controller_skips_unchanged_state(self) -> None:
@@ -2036,7 +2086,7 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertTrue(first.changed)
             self.assertFalse(second.changed)
             self.assertTrue(third.changed)
-            self.assertIn("#FF3A00 1.6s pulse", (device / "LEDS.LED").read_text())
+            self.assertIn("#855300 0.7s pulse", (device / "LEDS.LED").read_text())
 
     def test_battery_parser_uses_adapter_watts_and_raw_capacity(self) -> None:
         payload = plistlib.dumps(
@@ -2525,7 +2575,7 @@ class AgentMonitorTests(unittest.TestCase):
             )
             settings = settings.with_lid_animation(
                 LID_ANIMATION_CLOSED,
-                program="off\n#FF3A00 200ms ease",
+                program="off\n#FFA000 200ms ease",
                 duration_seconds=1.4,
             )
             settings = settings.with_lid_animation(
@@ -2540,7 +2590,7 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(loaded.closed_lid_awake_policy, CLOSED_LID_AWAKE_AGENTS)
             self.assertEqual(
                 loaded.lid_animation(LID_ANIMATION_CLOSED).program,
-                "off\n#FF3A00 200ms ease",
+                "off\n#FFA000 200ms ease",
             )
             self.assertEqual(
                 loaded.lid_animation(LID_ANIMATION_OPEN).duration_seconds,
@@ -3899,13 +3949,14 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(snapshot.statuses, ())
             self.assertEqual(snapshot.stale_statuses[0].mode, AgentMode.COMPLETED)
 
-    def test_final_question_maps_to_waiting_for_input(self) -> None:
+    def test_final_question_on_stop_maps_to_completed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "codex.jsonl"
+            now = datetime.now(timezone.utc).isoformat()
             log.write_text(
                 json.dumps(
                     {
-                        "logged_at": "2026-06-20T06:00:00Z",
+                        "logged_at": now,
                         "event": {
                             "hook_event_name": "Stop",
                             "session_id": "codex-session",
@@ -3923,7 +3974,7 @@ class AgentMonitorTests(unittest.TestCase):
             )
             snapshot = monitor.snapshot()
 
-            self.assertEqual(snapshot.aggregate.mode, AgentMode.WAITING_FOR_INPUT)
+            self.assertEqual(snapshot.aggregate.mode, AgentMode.COMPLETED)
 
     def test_anything_else_prompt_maps_to_completed_before_recaps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3959,13 +4010,14 @@ class AgentMonitorTests(unittest.TestCase):
 
             self.assertEqual(snapshot.aggregate.mode, AgentMode.COMPLETED)
 
-    def test_concrete_followup_question_maps_to_waiting_for_input(self) -> None:
+    def test_concrete_followup_question_on_stop_maps_to_completed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "claude.jsonl"
+            now = datetime.now(timezone.utc).isoformat()
             log.write_text(
                 json.dumps(
                     {
-                        "logged_at": "2026-06-20T06:00:00Z",
+                        "logged_at": now,
                         "hook_event_name": "Stop",
                         "session_id": "claude-session",
                         "last_assistant_message": (
@@ -3984,7 +4036,7 @@ class AgentMonitorTests(unittest.TestCase):
             )
             snapshot = monitor.snapshot()
 
-            self.assertEqual(snapshot.aggregate.mode, AgentMode.WAITING_FOR_INPUT)
+            self.assertEqual(snapshot.aggregate.mode, AgentMode.COMPLETED)
 
     def test_question_examples_in_inline_code_do_not_map_to_waiting_for_input(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4020,13 +4072,14 @@ class AgentMonitorTests(unittest.TestCase):
 
             self.assertEqual(snapshot.aggregate.mode, AgentMode.COMPLETED)
 
-    def test_real_question_with_inline_code_maps_to_waiting_for_input(self) -> None:
+    def test_question_with_inline_code_on_stop_maps_to_completed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "codex.jsonl"
+            now = datetime.now(timezone.utc).isoformat()
             log.write_text(
                 json.dumps(
                     {
-                        "logged_at": "2026-06-20T06:00:00Z",
+                        "logged_at": now,
                         "event": {
                             "hook_event_name": "Stop",
                             "session_id": "codex-session",
@@ -4040,6 +4093,58 @@ class AgentMonitorTests(unittest.TestCase):
             monitor = AgentMonitor(
                 sources=(SourceSpec("codex", log),),
                 stale_after_seconds=999999999,
+            )
+            snapshot = monitor.snapshot()
+
+            self.assertEqual(snapshot.aggregate.mode, AgentMode.COMPLETED)
+
+    def test_explicit_ask_marker_on_stop_maps_to_waiting_for_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "claude.jsonl"
+            log.write_text(
+                json.dumps(
+                    {
+                        "logged_at": "2026-06-20T06:00:00Z",
+                        "hook_event_name": "Stop",
+                        "session_id": "claude-session",
+                        "last_assistant_message": (
+                            "Which database should I migrate first?\n"
+                            "<!-- sidepulse:ask -->"
+                        ),
+                    }
+                )
+                + "\n"
+            )
+
+            monitor = AgentMonitor(
+                sources=(SourceSpec("claude", log),),
+                stale_after_seconds=999999999,
+                tool_running_timeout_seconds=0,
+            )
+            snapshot = monitor.snapshot()
+
+            self.assertEqual(snapshot.aggregate.mode, AgentMode.WAITING_FOR_INPUT)
+
+    def test_permission_request_still_maps_to_waiting_for_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "codex.jsonl"
+            log.write_text(
+                json.dumps(
+                    {
+                        "logged_at": "2026-06-20T06:00:00Z",
+                        "event": {
+                            "hook_event_name": "PermissionRequest",
+                            "session_id": "codex-session",
+                        },
+                    }
+                )
+                + "\n"
+            )
+
+            monitor = AgentMonitor(
+                sources=(SourceSpec("codex", log),),
+                stale_after_seconds=999999999,
+                tool_running_timeout_seconds=0,
             )
             snapshot = monitor.snapshot()
 
@@ -4474,6 +4579,299 @@ team id YOUR_TEAM_ID, push key '/path/to/AuthKey_YOUR_KEY_ID.p8'
                 "vscode://anthropic.claude-code/open?session=1ca4348e-2aec-4147-9e81-d7d56364d257",
             ),
         )
+
+
+class FleetDisplayTests(unittest.TestCase):
+    def _status(self, agent_id: str, mode: AgentMode) -> AgentStatus:
+        return AgentStatus(
+            provider="claude",
+            agent_id=agent_id,
+            display_name=agent_id,
+            mode=mode,
+            updated_at=datetime.now(timezone.utc),
+            event_name="Stop",
+            session_id=agent_id,
+            cwd=f"/tmp/{agent_id}",
+        )
+
+    def test_fleet_program_gives_each_agent_its_own_band(self) -> None:
+        bands = [
+            FleetBand(LedDisplayState.DONE, 2),
+            FleetBand(LedDisplayState.WORKING, 1),
+        ]
+        program = fleet_program(bands)
+        lines = program.splitlines()
+
+        # Two steady greens, one pulsing blue, every unused slot dark.
+        self.assertIn("0:#004A1E", lines[0])
+        self.assertIn("1:#004A1E", lines[0])
+        self.assertIn("2:#000000", lines[0])
+        self.assertEqual(lines[1], "2:#0033FF 1800ms pulse")
+        self.assertEqual(lines[2], "repeat")
+        self.assertLessEqual(len(program.encode()), 512)
+        self.assertLessEqual(len(lines), 20)
+
+    def test_fleet_program_mixes_states_on_one_shared_cycle(self) -> None:
+        bands = [
+            FleetBand(LedDisplayState.DONE, 1),
+            FleetBand(LedDisplayState.BLOCKED, 1),
+            FleetBand(LedDisplayState.WORKING, 1),
+            FleetBand(LedDisplayState.ASK, 1),
+        ]
+        program = fleet_program(bands)
+        pulses = program.splitlines()[1]
+
+        # Distinct duty cycles are what separate the states, since the
+        # controller can only run one timeline.
+        self.assertIn("1:#FF0000 400ms pulse", pulses)
+        self.assertIn("2:#0033FF 1800ms pulse", pulses)
+        self.assertIn("3:#855300 700ms pulse", pulses)
+        self.assertLessEqual(len(program.encode()), 512)
+
+    def test_wide_band_animates_as_a_wave_narrow_band_does_not(self) -> None:
+        # 3+ LEDs: stagger the pulses so the band visibly travels.
+        wide = fleet_program([FleetBand(LedDisplayState.WORKING, 4)]).splitlines()[1]
+        self.assertIn("0:#0033FF 1800ms pulse", wide)
+        self.assertIn("1:#0033FF 1800ms pulse 200ms", wide)
+        self.assertIn("2:#0033FF 1800ms pulse 400ms", wide)
+        self.assertIn("3:#0033FF 1800ms pulse 600ms", wide)
+
+        # 2 LEDs is too narrow to read as motion, so it pulses in unison.
+        narrow = fleet_program([FleetBand(LedDisplayState.WORKING, 2)]).splitlines()[1]
+        self.assertNotIn("ms pulse ", narrow)
+
+    def test_full_width_wave_stays_inside_device_limits(self) -> None:
+        program = fleet_program([FleetBand(LedDisplayState.ASK, 8)])
+        self.assertLessEqual(len(program.encode()), 512)
+        self.assertLessEqual(len(program.splitlines()), 20)
+
+    def test_palette_is_luminance_balanced(self) -> None:
+        # A green LED reads ~3.5x brighter than blue at the same drive level, and
+        # Done is the only state held steady at full duty, so a raw palette both
+        # glares and loads the LED hardest exactly where it runs longest.
+        working = relative_luminance(WORKING_BLUE)
+        self.assertAlmostEqual(relative_luminance(DONE_GREEN), working, delta=0.02)
+
+        # Ask keeps deliberate headroom as an alert, but far below the raw 3.1x.
+        ratio = relative_luminance(ASK_AMBER) / working
+        self.assertGreater(ratio, 1.2)
+        self.assertLess(ratio, 2.0)
+
+    def test_scaled_to_luminance_only_dims(self) -> None:
+        dim = "#001100"
+        self.assertEqual(scaled_to_luminance(dim, 1.0), dim)
+        self.assertLess(
+            relative_luminance(scaled_to_luminance("#FFFFFF", 0.2)),
+            relative_luminance("#FFFFFF"),
+        )
+
+    def test_blink_rate_tracks_urgency(self) -> None:
+        # The invariant behind the constants: the faster a slot blinks, the more
+        # it wants you. Working needs nothing, so it is the slowest animation.
+        self.assertLess(
+            FLEET_PULSE_MS[LedDisplayState.BLOCKED],
+            FLEET_PULSE_MS[LedDisplayState.ASK],
+        )
+        self.assertLess(
+            FLEET_PULSE_MS[LedDisplayState.ASK],
+            FLEET_PULSE_MS[LedDisplayState.WORKING],
+        )
+        # Done and Idle ask nothing of you, so they never animate at all.
+        self.assertNotIn(LedDisplayState.DONE, FLEET_PULSE_MS)
+        self.assertNotIn(LedDisplayState.IDLE, FLEET_PULSE_MS)
+
+    def test_closed_session_releases_its_band(self) -> None:
+        # Closing a window is not "work to go look at". If SessionEnd counted as
+        # Completed, every closed session would hold a green band for 20 minutes
+        # and a fresh session would get a sliver of the bar.
+        from sidepulse.collector import HookEvent, mode_for_event
+
+        record = HookEvent(
+            provider="claude",
+            logged_at=datetime.now(timezone.utc),
+            event_name="SessionEnd",
+            session_id="gone",
+            raw={"hook_event_name": "SessionEnd", "session_id": "gone"},
+        )
+        self.assertEqual(mode_for_event(record), AgentMode.IDLE_READY)
+
+    def test_fleet_drops_stale_done_bands(self) -> None:
+        # Safety net for sessions that die without a SessionEnd.
+        now = datetime.now(timezone.utc)
+        fresh = AgentStatus(
+            provider="claude",
+            agent_id="claude:session:fresh",
+            display_name="fresh",
+            mode=AgentMode.COMPLETED,
+            updated_at=now - timedelta(seconds=60),
+            event_name="Stop",
+            session_id="fresh",
+            cwd="/tmp/fresh",
+        )
+        ancient = AgentStatus(
+            provider="claude",
+            agent_id="claude:session:ancient",
+            display_name="ancient",
+            mode=AgentMode.COMPLETED,
+            updated_at=now - timedelta(seconds=900),
+            event_name="Stop",
+            session_id="ancient",
+            cwd="/tmp/ancient",
+        )
+
+        visible = fleet_visible_statuses([fresh, ancient], now=now)
+        self.assertEqual([status.agent_id for status in visible], [fresh.agent_id])
+
+    def test_fleet_hides_subagents(self) -> None:
+        # Subagents belong to a session's work; giving each one an LED turns
+        # three real agents into a full bar.
+        statuses = [
+            self._status("claude:session:aaa", AgentMode.WORKING),
+            self._status("claude:agent:bbb", AgentMode.COMPLETED),
+            self._status("claude:session:ccc", AgentMode.COMPLETED),
+        ]
+        self.assertEqual(
+            [status.agent_id for status in fleet_visible_statuses(statuses)],
+            ["claude:session:aaa", "claude:session:ccc"],
+        )
+
+    def test_fleet_program_holds_without_repeat_when_nothing_animates(self) -> None:
+        program = fleet_program([FleetBand(LedDisplayState.DONE, 1)])
+        self.assertNotIn("repeat", program)
+        self.assertEqual(len(program.splitlines()), 1)
+
+    def test_fleet_slots_stay_put_when_a_neighbor_finishes(self) -> None:
+        slots = FleetSlots(led_count=8)
+        self.assertEqual(slots.assign(["a", "b", "c"]), {"a": 0, "b": 1, "c": 2})
+
+        # "a" drops out: b and c must keep their slots instead of shifting left,
+        # otherwise the whole bar reflows every time an agent finishes.
+        self.assertEqual(slots.assign(["b", "c"]), {"b": 1, "c": 2})
+
+        # A new agent claims the freed slot.
+        self.assertEqual(slots.assign(["b", "c", "d"]), {"b": 1, "c": 2, "d": 0})
+
+    def test_fleet_slots_ignore_overflow_past_led_count(self) -> None:
+        slots = FleetSlots(led_count=2)
+        self.assertEqual(slots.assign(["a", "b", "c"]), {"a": 0, "b": 1})
+
+    def test_fleet_spreads_agents_across_the_whole_bar(self) -> None:
+        # Three agents split 8 LEDs as 3/3/2 rather than lighting one pixel each.
+        slots = FleetSlots(led_count=8)
+        statuses = [
+            self._status("a", AgentMode.COMPLETED),
+            self._status("b", AgentMode.BLOCKED_ERROR),
+            self._status("c", AgentMode.TOOL_RUNNING),
+        ]
+        result = fleet_bands_for_statuses(statuses, slots, led_count=8)
+
+        self.assertEqual(
+            result,
+            [
+                FleetBand(LedDisplayState.DONE, 3),
+                FleetBand(LedDisplayState.BLOCKED, 3),
+                FleetBand(LedDisplayState.WORKING, 2),
+            ],
+        )
+        self.assertEqual(fleet_representative_state(result), LedDisplayState.BLOCKED)
+
+    def test_agents_in_the_same_state_merge_into_one_animation(self) -> None:
+        # Band boundaries carry no information when everyone agrees, so the bar
+        # should read as one wide animation rather than N identical slices.
+        slots = FleetSlots(led_count=8)
+        statuses = [
+            self._status("a", AgentMode.TOOL_RUNNING),
+            self._status("b", AgentMode.WORKING),
+        ]
+        self.assertEqual(
+            fleet_bands_for_statuses(statuses, slots, led_count=8),
+            [FleetBand(LedDisplayState.WORKING, 8)],
+        )
+
+        # One disagreement is enough to split the bar again.
+        statuses.append(self._status("c", AgentMode.COMPLETED))
+        self.assertEqual(
+            fleet_bands_for_statuses(statuses, FleetSlots(led_count=8), led_count=8),
+            [
+                FleetBand(LedDisplayState.WORKING, 3),
+                FleetBand(LedDisplayState.WORKING, 3),
+                FleetBand(LedDisplayState.DONE, 2),
+            ],
+        )
+
+    def test_single_agent_uses_every_led(self) -> None:
+        slots = FleetSlots(led_count=8)
+        result = fleet_bands_for_statuses(
+            [self._status("a", AgentMode.TOOL_RUNNING)], slots, led_count=8
+        )
+        self.assertEqual(result, [FleetBand(LedDisplayState.WORKING, 8)])
+
+    def test_fleet_collapses_sessions_sharing_a_codebase(self) -> None:
+        # Sessions turn over inside one project; the user is watching one
+        # window, so it must claim one band, not one per session id.
+        working = AgentStatus(
+            provider="claude",
+            agent_id="claude:session:new",
+            display_name="new",
+            mode=AgentMode.TOOL_RUNNING,
+            updated_at=datetime.now(timezone.utc),
+            event_name="PreToolUse",
+            session_id="new",
+            cwd="/Users/me/project",
+        )
+        finished = AgentStatus(
+            provider="claude",
+            agent_id="claude:session:old",
+            display_name="old",
+            mode=AgentMode.COMPLETED,
+            updated_at=datetime.now(timezone.utc),
+            event_name="Stop",
+            session_id="old",
+            cwd="/Users/me/project",
+        )
+
+        visible = fleet_visible_statuses([working, finished])
+        self.assertEqual(len(visible), 1)
+        self.assertEqual(visible[0].agent_id, "claude:session:new")
+
+    def test_completion_announcer_holds_done_then_expires(self) -> None:
+        announcer = CompletionAnnouncer(hold_seconds=5.0)
+        self.assertFalse(
+            announcer.observe([self._status("a", AgentMode.WORKING)], now=0.0)
+        )
+
+        done = [self._status("a", AgentMode.COMPLETED)]
+        self.assertTrue(announcer.observe(done, now=1.0))
+        self.assertTrue(announcer.started)
+        self.assertTrue(announcer.observe(done, now=4.0))
+        self.assertFalse(announcer.observe(done, now=6.5))
+
+    def test_completion_announcer_ignores_agents_first_seen_completed(self) -> None:
+        # The app replays history on restart; an already-finished agent must not
+        # trigger a fresh announcement.
+        announcer = CompletionAnnouncer()
+        self.assertFalse(
+            announcer.observe([self._status("a", AgentMode.COMPLETED)], now=0.0)
+        )
+
+    def test_global_led_display_overrides_per_device_settings(self) -> None:
+        from sidepulse.settings import AgentMonitorSettings
+
+        settings = AgentMonitorSettings().with_device_display(
+            "/Volumes/SidePulse", "agent"
+        )
+        self.assertEqual(settings.display_for_device("/Volumes/SidePulse"), "agent")
+
+        # display_for_device prefers the per-device value, so the global switch
+        # has to reach the devices or it silently does nothing.
+        switched = settings.with_led_display("fleet")
+        self.assertEqual(switched.display_for_device("/Volumes/SidePulse"), "fleet")
+
+    def test_completion_announcement_never_masks_ask_or_blocked(self) -> None:
+        self.assertTrue(announcement_may_show(AgentMode.WORKING))
+        self.assertTrue(announcement_may_show(AgentMode.TOOL_RUNNING))
+        self.assertFalse(announcement_may_show(AgentMode.WAITING_FOR_INPUT))
+        self.assertFalse(announcement_may_show(AgentMode.BLOCKED_ERROR))
 
 
 if __name__ == "__main__":

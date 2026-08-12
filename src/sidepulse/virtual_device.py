@@ -19,7 +19,16 @@ from AppKit import (
 from Foundation import NSObject, NSTimer
 from Quartz import CGContextFillRect, CGContextSetRGBFillColor
 
-from .led_status import LedDisplayState, normalize_brightness, program_for_display_state
+from .led_status import (
+    ASK_AMBER,
+    BLOCKED_RED,
+    DONE_GREEN,
+    IDLE_DIM,
+    WORKING_BLUE,
+    LedDisplayState,
+    normalize_brightness,
+    program_for_display_state,
+)
 from .led_wasm import LedWasmUnavailableError, SdLedWasmController
 
 
@@ -29,7 +38,17 @@ LED_COUNT = 8
 WINDOW_WIDTH = 220.0
 FALLBACK_NOTCH_DEPTH = 32.0
 LED_BAND_HEIGHT = 5.0
+# With no notch to tuck under, a 5 px sliver at the top of a large display is
+# effectively invisible, so bare screens get a taller band.
+BARE_LED_BAND_HEIGHT = 14.0
 WINDOW_HEIGHT = FALLBACK_NOTCH_DEPTH + LED_BAND_HEIGHT
+# Desktop webcams sit exactly where a notch would be, so the bar can hide
+# behind one. Position is settable for that case.
+POSITION_LEFT = "left"
+POSITION_CENTER = "center"
+POSITION_RIGHT = "right"
+POSITION_CHOICES = (POSITION_LEFT, POSITION_CENTER, POSITION_RIGHT)
+POSITION_INSET = 24.0
 NOTCH_BOTTOM_RADIUS = 8.0
 LED_BLEND_RADIUS_LEDS = 1.5
 BLEND_COLUMN_WIDTH = 2.0
@@ -71,15 +90,33 @@ def screen_has_notch(screen) -> bool:
     return notch_depth_for_screen(screen) > 0.0
 
 
-def window_height_for_notch_depth(notch_depth: float) -> float:
-    return max(0.0, float(notch_depth)) + LED_BAND_HEIGHT
+def led_band_height_for_screen(screen) -> float:
+    return LED_BAND_HEIGHT if screen_has_notch(screen) else BARE_LED_BAND_HEIGHT
 
 
-def virtual_window_frame_for_screen(screen):
+def window_height_for_notch_depth(
+    notch_depth: float,
+    band_height: float = LED_BAND_HEIGHT,
+) -> float:
+    return max(0.0, float(notch_depth)) + band_height
+
+
+def window_x_for_position(frame, width: float, position: str) -> float:
+    if position == POSITION_LEFT:
+        return frame.origin.x + POSITION_INSET
+    if position == POSITION_RIGHT:
+        return frame.origin.x + frame.size.width - width - POSITION_INSET
+    return frame.origin.x + (frame.size.width - width) / 2.0
+
+
+def virtual_window_frame_for_screen(screen, position: str = POSITION_CENTER):
     frame = screen.frame()
     width = slot_width_for_screen(screen)
-    height = window_height_for_notch_depth(notch_depth_for_screen(screen))
-    x = frame.origin.x + (frame.size.width - width) / 2.0
+    height = window_height_for_notch_depth(
+        notch_depth_for_screen(screen),
+        led_band_height_for_screen(screen),
+    )
+    x = window_x_for_position(frame, width, position)
     y = frame.origin.y + frame.size.height - height
     return ((x, y), (width, height))
 
@@ -116,6 +153,11 @@ def notch_bar_path(rect):
     return path
 
 
+def rgb_floats(hex_color: str) -> tuple[float, float, float]:
+    """Derive the on-screen color from the same constant the device is sent."""
+    return tuple(int(hex_color[i : i + 2], 16) / 255.0 for i in (1, 3, 5))
+
+
 def virtual_led_colors(
     state: LedDisplayState,
     elapsed: float,
@@ -124,24 +166,44 @@ def virtual_led_colors(
     """Return the eight LED colors for the same status animations as the device."""
     scale = normalize_brightness(brightness) / 255.0
     if state == LedDisplayState.DONE:
-        return [(0.0, scale, 0.4 * scale, 1.0)] * LED_COUNT
+        red, green, blue = rgb_floats(DONE_GREEN)
+        return [(red * scale, green * scale, blue * scale, 1.0)] * LED_COUNT
     if state == LedDisplayState.ASK:
-        amount = 0.5 - 0.5 * math.cos(2.0 * math.pi * (elapsed % 1.6) / 1.6)
-        return [(scale * amount, 0.227 * scale * amount, 0.0, amount)] * LED_COUNT
+        red, green, blue = rgb_floats(ASK_AMBER)
+        amount = 0.5 - 0.5 * math.cos(2.0 * math.pi * (elapsed % 0.7) / 0.7)
+        return [
+            (red * scale * amount, green * scale * amount, blue * scale * amount, amount)
+        ] * LED_COUNT
+    if state == LedDisplayState.BLOCKED:
+        # Mirrors the BLOCKED program: two 420 ms pulses, 120 ms apart, then a
+        # 1.1 s pause.
+        red, green, blue = rgb_floats(BLOCKED_RED)
+        local = elapsed % 2.06
+        if local >= 0.54:
+            local -= 0.54
+        amount = math.sin(math.pi * local / 0.42) ** 2 if 0.0 <= local <= 0.42 else 0.0
+        return [
+            (red * scale * amount, green * scale * amount, blue * scale * amount, amount)
+        ] * LED_COUNT
     if state == LedDisplayState.IDLE:
+        red, green, blue = rgb_floats(IDLE_DIM)
         amount = 0.5 - 0.5 * math.cos(2.0 * math.pi * (elapsed % 6.0) / 6.0)
-        dim = 2.0 / 255.0
-        return [(dim * scale * amount, dim * scale * amount, 2 * dim * scale * amount, amount)] * LED_COUNT
+        return [
+            (red * scale * amount, green * scale * amount, blue * scale * amount, amount)
+        ] * LED_COUNT
 
-    # Mirrors rolling_program(): 760 ms pulses staggered by 95 ms.
-    cycle = 0.76 + 0.095 * (LED_COUNT - 1)
+    # Mirrors rolling_program(): 1200 ms pulses staggered by 140 ms.
+    red, green, blue = rgb_floats(WORKING_BLUE)
+    cycle = 1.2 + 0.14 * (LED_COUNT - 1)
     colors = []
     for index in range(LED_COUNT):
-        local = (elapsed % cycle) - index * 0.095
+        local = (elapsed % cycle) - index * 0.14
         amount = 0.0
-        if 0.0 <= local <= 0.76:
-            amount = math.sin(math.pi * local / 0.76) ** 2
-        colors.append((0.0, 0.898 * scale * amount, scale * amount, amount))
+        if 0.0 <= local <= 1.2:
+            amount = math.sin(math.pi * local / 1.2) ** 2
+        colors.append(
+            (red * scale * amount, green * scale * amount, blue * scale * amount, amount)
+        )
     return colors
 
 
@@ -233,10 +295,12 @@ class VirtualLedView(NSView):
             self.wasm_controller = None
             self.wasm_error = None
             self.has_notch = True
+            self.band_height = LED_BAND_HEIGHT
         return self
 
     def setHasNotch_(self, has_notch):
         self.has_notch = bool(has_notch)
+        self.band_height = LED_BAND_HEIGHT if self.has_notch else BARE_LED_BAND_HEIGHT
         self.setNeedsDisplay_(True)
 
     def setState_brightness_(self, state, brightness):
@@ -336,7 +400,7 @@ class VirtualLedView(NSView):
         cg_context = current_cg_context()
 
         led_width = width / LED_COUNT
-        glow_height = min(LED_GLOW_HEIGHT, max(0.0, height - LED_BAND_HEIGHT))
+        glow_height = min(LED_GLOW_HEIGHT, max(0.0, height - self.band_height))
         column_x = 0.0
         while column_x < width:
             column_width = min(BLEND_COLUMN_WIDTH, width - column_x)
@@ -350,7 +414,7 @@ class VirtualLedView(NSView):
             # the neighboring LED width on both sides, for a three-LED footprint.
             fill_rect_with_cg(
                 cg_context,
-                ((column_x, LED_BAND_HEIGHT), (column_width, glow_height * 0.45)),
+                ((column_x, self.band_height), (column_width, glow_height * 0.45)),
                 tone_mapped_led_color(
                     red, green, blue, alpha, boost=0.82, alpha_scale=0.18
                 ),
@@ -358,7 +422,7 @@ class VirtualLedView(NSView):
             fill_rect_with_cg(
                 cg_context,
                 (
-                    (column_x, LED_BAND_HEIGHT + glow_height * 0.45),
+                    (column_x, self.band_height + glow_height * 0.45),
                     (column_width, glow_height * 0.55),
                 ),
                 tone_mapped_led_color(
@@ -367,7 +431,7 @@ class VirtualLedView(NSView):
             )
             fill_rect_with_cg(
                 cg_context,
-                ((column_x, 0.0), (column_width, LED_BAND_HEIGHT)),
+                ((column_x, 0.0), (column_width, self.band_height)),
                 tone_mapped_led_color(
                     red, green, blue, alpha, boost=LED_CORE_BOOST, alpha_scale=0.92
                 ),
@@ -384,7 +448,7 @@ class VirtualLedView(NSView):
         if self.has_notch:
             fill_rect_with_cg(
                 cg_context,
-                ((0.0, LED_BAND_HEIGHT - 0.55), (width, 0.55)),
+                ((0.0, self.band_height - 0.55), (width, 0.55)),
                 (0.0, 0.0, 0.0, 0.18),
             )
             fill_rect_with_cg(
@@ -402,7 +466,13 @@ class VirtualStatusDevice(NSObject):
             self.window = None
             self.view = None
             self.timer = None
+            self.position = POSITION_CENTER
         return self
+
+    def set_position(self, position):
+        self.position = position if position in POSITION_CHOICES else POSITION_CENTER
+        if self.window is not None:
+            self.reposition()
 
     def show(self):
         if self.window is None:
@@ -437,7 +507,7 @@ class VirtualStatusDevice(NSObject):
         screen = NSScreen.mainScreen()
         if screen is None or self.window is None:
             return
-        window_frame = virtual_window_frame_for_screen(screen)
+        window_frame = virtual_window_frame_for_screen(screen, self.position)
         self.window.setFrame_display_(window_frame, True)
         if self.view is not None:
             self.view.setHasNotch_(screen_has_notch(screen))

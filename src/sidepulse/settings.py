@@ -13,7 +13,18 @@ from .session_actions import SESSION_OPEN_CHOICES
 
 LED_DISPLAY_AGENT = "agent"
 LED_DISPLAY_BATTERY = "battery"
-LED_DISPLAY_CHOICES = (LED_DISPLAY_AGENT, LED_DISPLAY_BATTERY)
+LED_DISPLAY_FLEET = "fleet"
+LED_DISPLAY_CHOICES = (LED_DISPLAY_AGENT, LED_DISPLAY_BATTERY, LED_DISPLAY_FLEET)
+# Screen Bar placement. A desktop webcam sits where a notch would be, so the
+# centered default can end up hidden behind it.
+VIRTUAL_POSITION_CHOICES = ("left", "center", "right")
+
+
+def _virtual_position_setting(value: object) -> str:
+    text = str(value).strip().lower() if value is not None else ""
+    return text if text in VIRTUAL_POSITION_CHOICES else "center"
+
+
 CLOSED_LID_AWAKE_NEVER = "never"
 CLOSED_LID_AWAKE_AGENTS = "agents"
 CLOSED_LID_AWAKE_ALWAYS = "always"
@@ -95,6 +106,7 @@ class AgentMonitorSettings:
     led_display: str = LED_DISPLAY_AGENT
     devices: tuple[DeviceDisplaySetting, ...] = ()
     virtual_status_device_enabled: bool = False
+    virtual_status_device_position: str = "center"
     closed_lid_awake_policy: str = CLOSED_LID_AWAKE_NEVER
     closed_lid_system_override_enabled: bool = False
     lid_closed_animation: LedAnimationSetting = field(
@@ -126,7 +138,12 @@ class AgentMonitorSettings:
     def with_led_display(self, display: str) -> "AgentMonitorSettings":
         if display not in LED_DISPLAY_CHOICES:
             raise ValueError(f"Unknown LED display: {display}")
-        return replace(self, led_display=display)
+        # Every known device carries its own override and display_for_device
+        # prefers it, so setting the global alone would silently do nothing.
+        devices = tuple(
+            replace(device, led_display=display) for device in self.devices
+        )
+        return replace(self, led_display=display, devices=devices)
 
     def display_for_device(self, device_id: str) -> str:
         for device in self.devices:
@@ -343,11 +360,17 @@ class AgentMonitorSettings:
     def with_virtual_status_device(self, enabled: bool) -> "AgentMonitorSettings":
         return replace(self, virtual_status_device_enabled=bool(enabled))
 
+    def with_virtual_status_device_position(self, position: str) -> "AgentMonitorSettings":
+        if position not in VIRTUAL_POSITION_CHOICES:
+            raise ValueError(f"Unknown screen bar position: {position}")
+        return replace(self, virtual_status_device_position=position)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "led_display": self.led_display,
             "devices": [device.to_dict() for device in self.devices],
             "virtual_status_device_enabled": self.virtual_status_device_enabled,
+            "virtual_status_device_position": self.virtual_status_device_position,
             "closed_lid_awake_policy": self.closed_lid_awake_policy,
             "closed_lid_system_override_enabled": self.closed_lid_system_override_enabled,
             "lid_closed_animation": self.lid_closed_animation.to_dict(),
@@ -407,6 +430,9 @@ def load_settings(path: Path | None = None) -> AgentMonitorSettings:
         claude_transcripts_enabled=_bool_setting(transcript.get("claude"), False),
         led_display=led_display,
         devices=_device_display_settings(data.get("devices"), led_display),
+        virtual_status_device_position=_virtual_position_setting(
+            data.get("virtual_status_device_position")
+        ),
         virtual_status_device_enabled=_bool_setting(
             data.get("virtual_status_device_enabled"), False
         ),

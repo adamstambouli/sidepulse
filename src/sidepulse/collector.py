@@ -82,6 +82,10 @@ class MonitorSnapshot:
     stale_statuses: tuple[AgentStatus, ...]
     sources: tuple[SourceSpec, ...]
     collected_at: datetime
+    # Everything still inside its visibility window, including the completions
+    # that `statuses` evicts as soon as another agent is active. A per-agent
+    # display needs those: "two done, one still going" is the whole point.
+    fresh_statuses: tuple[AgentStatus, ...] = ()
 
     def to_dict(self) -> dict:
         return {
@@ -162,6 +166,7 @@ class AgentMonitor:
             else:
                 fresh.append(current)
 
+        within_window = list(fresh)
         if any(status_counts_active(status) for status in fresh):
             inactive = [status for status in fresh if not status_counts_active(status)]
             fresh = [status for status in fresh if status_counts_active(status)]
@@ -169,6 +174,9 @@ class AgentMonitor:
 
         fresh.sort(key=lambda status: (status.priority, -status.updated_at.timestamp()))
         stale.sort(key=lambda status: (status.priority, -status.updated_at.timestamp()))
+        within_window.sort(
+            key=lambda status: (status.priority, -status.updated_at.timestamp())
+        )
 
         visible = tuple(fresh)
         stale_visible = tuple(stale if include_stale else stale)
@@ -180,6 +188,7 @@ class AgentMonitor:
             stale_statuses=stale_visible,
             sources=self.sources,
             collected_at=now,
+            fresh_statuses=tuple(within_window),
         )
 
     def _latest_statuses(self) -> dict[str, AgentStatus]:
@@ -1054,11 +1063,17 @@ def mode_for_event(record: HookEvent) -> AgentMode | None:
     if event in {"UserPromptSubmit", "PreCompact", "PostCompact", "SubagentStart"}:
         return AgentMode.WORKING
     if event in {"Stop", "SubagentStop"}:
-        if _assistant_message_asks_question(raw.get("last_assistant_message")):
-            return AgentMode.WAITING_FOR_INPUT
+        # A Stop means the agent yielded its turn voluntarily, so nothing is
+        # stranded. A genuine block arrives as PermissionRequest/Notification
+        # instead. An agent that really needs an answer says so explicitly with
+        # a <!-- sidepulse:ask --> marker, handled by explicit_mode_for_record
+        # above.
         return AgentMode.COMPLETED
     if event in {"SessionEnd"}:
-        return AgentMode.COMPLETED
+        # The window is closed, so there is nothing left to go look at. Treating
+        # this as Completed would hold a Done slot for the full 20 minute
+        # Completed window even though the session is gone.
+        return AgentMode.IDLE_READY
     if event == "SessionStart":
         return AgentMode.IDLE_READY
     return None
@@ -1157,10 +1172,6 @@ def strip_markdown_code_blocks(text: str) -> str:
     return re.sub(r"```.*?```", "", text, flags=re.DOTALL)
 
 
-def strip_markdown_inline_code(text: str) -> str:
-    return re.sub(r"`[^`\n]*`", "", text)
-
-
 def aggregate_status(
     statuses: tuple[AgentStatus, ...],
     stale_statuses: tuple[AgentStatus, ...] = (),
@@ -1223,6 +1234,7 @@ def snapshot_from_statuses(
         else:
             fresh.append(current)
 
+    within_window = list(fresh)
     if any(status_counts_active(status) for status in fresh):
         inactive = [status for status in fresh if not status_counts_active(status)]
         fresh = [status for status in fresh if status_counts_active(status)]
@@ -1230,6 +1242,9 @@ def snapshot_from_statuses(
 
     fresh.sort(key=lambda status: (status.priority, -status.updated_at.timestamp()))
     stale.sort(key=lambda status: (status.priority, -status.updated_at.timestamp()))
+    within_window.sort(
+        key=lambda status: (status.priority, -status.updated_at.timestamp())
+    )
 
     visible = tuple(fresh)
     stale_visible = tuple(stale if include_stale else stale)
@@ -1239,6 +1254,7 @@ def snapshot_from_statuses(
         stale_statuses=stale_visible,
         sources=sources,
         collected_at=collected_at,
+        fresh_statuses=tuple(within_window),
     )
 
 
@@ -1631,101 +1647,3 @@ def _tool_response_looks_failed(response: object) -> bool:
         return "exit code: 1" in text or "traceback" in text
 
     return False
-
-
-def _assistant_message_asks_question(message: object) -> bool:
-    if not isinstance(message, str):
-        return False
-
-    text = strip_markdown_inline_code(strip_markdown_code_blocks(message))
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if not lines:
-        return False
-
-    for line in reversed(lines[-8:]):
-        if _assistant_status_line(line):
-            continue
-        if _assistant_line_asks_question(line):
-            return True
-
-    return False
-
-
-def _assistant_status_line(line: str) -> bool:
-    text = line.strip().lower()
-    return text.startswith(
-        (
-            "* cogitated ",
-            "* recap:",
-            "※ recap:",
-            "recap:",
-        )
-    )
-
-
-def _assistant_line_asks_question(line: str) -> bool:
-    text = line.strip()
-    if not text:
-        return False
-
-    lowered = text.lower()
-    if text.endswith(":"):
-        return False
-    if _assistant_line_is_casual_closing_question(lowered):
-        return False
-    if re.search(
-        r"(?:^|[.!?]\s+)(?:want me to|need me to|should i|should we|do you want me to)\b",
-        lowered,
-    ):
-        return True
-
-    required_question_prefixes = (
-        "which ",
-        "what ",
-        "where ",
-        "when ",
-        "who ",
-        "why ",
-        "how ",
-        "can you ",
-        "could you ",
-        "please confirm",
-        "please choose",
-        "choose ",
-        "need me to ",
-        "want me to ",
-        "should i ",
-        "should we ",
-        "do you want me to ",
-    )
-    if text.endswith("?"):
-        return lowered.startswith(required_question_prefixes)
-
-    return lowered.startswith(
-        (
-            "please confirm",
-            "please choose",
-            "choose ",
-            "need me to ",
-            "want me to ",
-            "should i ",
-            "should we ",
-            "do you want me to ",
-        )
-    )
-
-
-def _assistant_line_is_casual_closing_question(lowered: str) -> bool:
-    return lowered.startswith(
-        (
-            "anything else",
-            "any other",
-            "all good",
-            "need anything else",
-            "want anything else",
-            "anything you want",
-            "anything you'd like",
-            "anything else you want",
-            "anything else you'd like",
-        )
-    )
