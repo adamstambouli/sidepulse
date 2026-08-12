@@ -6,6 +6,83 @@
 They can display the status of an AI agent, battery level, or other system
 signals.
 
+---
+
+## About this fork
+
+My personal SidePulse setup, forked from
+[inteliwear/sidepulse](https://github.com/inteliwear/sidepulse). Upstream shows
+one aggregated state across every agent. I usually have three or four Claude
+Code sessions running at once in different codebases, so I rebuilt the display
+around that.
+
+### Fleet mode
+
+One band of LEDs per codebase instead of a single global state. The bar always
+spreads across whatever is running — one agent gets all eight LEDs, two get four
+each, three get 3/3/2 — and merges back into a single full-width animation when
+every agent is in the same state. Slots are sticky per codebase, so an agent
+finishing never shuffles its neighbors, and multiple sessions in one directory
+collapse into one band.
+
+Turn it on from the device submenu in the menu bar, or:
+
+```sh
+sidepulse battery configure --display fleet
+```
+
+| State | Color | Rhythm |
+| --- | --- | --- |
+| Blocked | red | 400 ms, sharp double blink |
+| Ask | amber | 700 ms |
+| Working | blue | 1800 ms, slow breath |
+| Done | green | steady, never animates |
+
+Blink rate tracks urgency: the faster it moves, the more it wants you. An agent
+that is still working needs nothing from you, so it is the calmest thing on the
+bar, and Done holds completely still — "moving versus settled" registers before
+color does. Bands of three or more LEDs animate as a travelling wave, since
+motion is much easier to catch peripherally than a change in brightness.
+
+### Palette
+
+The colors are luminance-matched rather than hand-picked. A green LED reads
+roughly 3.5× brighter than blue at the same drive level, because the eye peaks
+near green and bottoms out near blue. Done was both the brightest color and the
+only state held steady at full duty for up to 20 minutes, which made it the
+worst case for glare and the hardest on the LED. Every color is now scaled to
+the blue's Rec.709 luminance, which evens out the bar and cuts the sustained
+load on the one state that is always on.
+
+Working is blue rather than the original cyan: cyan and the Done green are
+adjacent hues and read as the same color on a diffused LED.
+
+### Status detection
+
+- A `Stop` event always means Done. Upstream matched the final assistant message
+  against phrases like "want me to…" and lit Ask on finished turns. A `Stop`
+  means the agent yielded its turn voluntarily, so nothing is blocked — a real
+  block arrives as `PermissionRequest` or `Notification` instead. An explicit
+  `<!-- sidepulse:ask -->` marker still wins.
+- `SessionEnd` releases the LEDs immediately instead of holding a Done band for
+  the full Completed window, so closing a session frees its share of the bar.
+- Blocked/Error is its own state, separate from Waiting-for-Input, in the LEDs,
+  the menu bar, and the Screen Bar.
+- Completions stay visible while other agents are still working, so finishing
+  one job out of several actually shows up.
+
+### Preview dashboard
+
+Every state and fleet combination, animated locally. It is generated from the
+live constants in `led_status.py`, so it cannot drift from the programs the
+device actually receives.
+
+```sh
+python3 scripts/preview_leds.py && open examples/led_preview.html
+```
+
+---
+
 | <img src="https://raw.githubusercontent.com/inteliwear/sidepulse/main/media/sidepulse-pro.jpg" alt="SidePulse Pro glowing pink in a MacBook Pro SD card slot" width="400"> | <img src="https://raw.githubusercontent.com/inteliwear/sidepulse/main/media/sidepulse-dot.jpg" alt="SidePulse Dot glowing green in a MacBook USB-C port" width="400"> |
 |:---:|:---:|
 | **SidePulse Pro** — eight-LED SD card device for MacBook Pro. | **SidePulse Dot** — tiny two-LED USB-C device. |
