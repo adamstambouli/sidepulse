@@ -4722,18 +4722,64 @@ class FleetDisplayTests(unittest.TestCase):
         visible = fleet_visible_statuses([fresh, ancient], now=now)
         self.assertEqual([status.agent_id for status in visible], [fresh.agent_id])
 
-    def test_fleet_hides_subagents(self) -> None:
-        # Subagents belong to a session's work; giving each one an LED turns
-        # three real agents into a full bar.
+    def _subagent(
+        self, agent_id: str, mode: AgentMode, *, session_id: str, cwd: str
+    ) -> AgentStatus:
+        return AgentStatus(
+            provider="claude",
+            agent_id=f"claude:agent:{agent_id}",
+            display_name=agent_id,
+            mode=mode,
+            updated_at=datetime.now(timezone.utc),
+            event_name="PreToolUse",
+            session_id=session_id,
+            cwd=cwd,
+        )
+
+    def test_busy_subagents_keep_the_parent_band_working(self) -> None:
+        # A session that hands off to subagents and reports done would otherwise
+        # go dark while its subagents are still grinding.
+        parent = AgentStatus(
+            provider="claude",
+            agent_id="claude:session:parent",
+            display_name="parent",
+            mode=AgentMode.COMPLETED,
+            updated_at=datetime.now(timezone.utc),
+            event_name="Stop",
+            session_id="parent",
+            cwd="/Users/me/project",
+        )
+        # Subagents run in isolated worktrees, so their cwd differs from the
+        # parent's; they must still roll up to the parent's codebase.
+        workers = [
+            self._subagent(
+                f"w{i}",
+                AgentMode.TOOL_RUNNING,
+                session_id="parent",
+                cwd=f"/tmp/worktree-{i}",
+            )
+            for i in range(5)
+        ]
+
+        visible = fleet_visible_statuses([parent, *workers])
+        self.assertEqual(len(visible), 1, "subagents must not claim their own bands")
+        self.assertEqual(visible[0].mode, AgentMode.TOOL_RUNNING)
+
+    def test_subagents_never_outnumber_real_sessions_on_the_bar(self) -> None:
         statuses = [
             self._status("claude:session:aaa", AgentMode.WORKING),
-            self._status("claude:agent:bbb", AgentMode.COMPLETED),
             self._status("claude:session:ccc", AgentMode.COMPLETED),
         ]
-        self.assertEqual(
-            [status.agent_id for status in fleet_visible_statuses(statuses)],
-            ["claude:session:aaa", "claude:session:ccc"],
-        )
+        statuses += [
+            self._subagent(
+                f"w{i}",
+                AgentMode.WORKING,
+                session_id="claude:session:aaa",
+                cwd="/tmp/claude:session:aaa",
+            )
+            for i in range(6)
+        ]
+        self.assertEqual(len(fleet_visible_statuses(statuses)), 2)
 
     def test_fleet_program_holds_without_repeat_when_nothing_animates(self) -> None:
         program = fleet_program([FleetBand(LedDisplayState.DONE, 1)])

@@ -324,6 +324,11 @@ class FleetSlots:
         self._slots.clear()
 
 
+def is_subagent(status: AgentStatus) -> bool:
+    """Subagents report their own status keyed `provider:agent:*`."""
+    return ":agent:" in (status.agent_id or "")
+
+
 def fleet_slot_key(status: AgentStatus) -> str:
     """A fleet slot belongs to a codebase, not a session.
 
@@ -339,17 +344,26 @@ def fleet_visible_statuses(
     now: object = None,
     done_visible_seconds: float = FLEET_DONE_VISIBLE_SECONDS,
 ) -> tuple[AgentStatus, ...]:
-    """One entry per codebase, top-level sessions only.
+    """One entry per codebase, showing that codebase's most actionable state.
 
-    Subagents report their own status keyed `provider:agent:*`. They are part of
-    one session's work rather than separate agents, so giving each an LED floods
-    the bar: three real sessions can easily present as eight. Multiple sessions
-    in the same directory collapse to their most actionable one.
+    Everything working on a codebase shares its band: multiple sessions in the
+    same directory, plus any subagents they spawned. Subagents never claim a
+    band of their own -- three real sessions would otherwise present as eight --
+    but their work still drives the parent's band, so a session that has handed
+    off to subagents reads as Working rather than going dark.
     """
+    ordered = list(statuses)
+    # A subagent works on behalf of a session, sometimes from its own worktree,
+    # so its cwd can differ from the parent's. Roll it up to the parent's
+    # codebase: its work belongs on that band rather than a band of its own.
+    parent_cwd = {
+        status.session_id: status.cwd
+        for status in ordered
+        if not is_subagent(status) and status.session_id and status.cwd
+    }
+
     best: dict[str, AgentStatus] = {}
-    for status in statuses:
-        if ":agent:" in (status.agent_id or ""):
-            continue
+    for status in ordered:
         if (
             status.mode == AgentMode.COMPLETED
             and done_visible_seconds >= 0
@@ -357,6 +371,8 @@ def fleet_visible_statuses(
         ):
             continue
         key = fleet_slot_key(status)
+        if is_subagent(status):
+            key = parent_cwd.get(status.session_id) or key
         current = best.get(key)
         if current is None or (
             status.priority,
