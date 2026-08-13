@@ -468,10 +468,23 @@ class LiveAgentMonitor:
         if self.latest_state_path is None:
             return
         now = datetime.now(timezone.utc)
+        # This file is a restart cache, so it only needs what a restart could
+        # still show. Keeping statuses past their visibility window grows the
+        # file forever and lets long-dead ones come back at the next launch --
+        # a subagent that stopped reporting yesterday reviving as Working.
         payload = {
             "updated_at": now.isoformat(),
             "statuses": [
-                status.to_dict(now) for status in self.statuses_by_key.values()
+                status.to_dict(now)
+                for status in self.statuses_by_key.values()
+                if not status_is_stale(
+                    status,
+                    now,
+                    stale_after_seconds=self.stale_after_seconds,
+                    tool_running_timeout_seconds=self.tool_running_timeout_seconds,
+                    completed_visible_seconds=self.completed_visible_seconds,
+                    idle_visible_seconds=self.idle_visible_seconds,
+                )
             ],
         }
         try:

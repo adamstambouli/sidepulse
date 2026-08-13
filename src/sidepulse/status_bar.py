@@ -101,6 +101,7 @@ from .led_status import (
     normalize_brightness,
     normalized_device_name,
     program_for_display_state,
+    subagent_still_counts,
     write_mode_to_leds,
     display_state_for_mode,
 )
@@ -2953,7 +2954,8 @@ def roll_subagents_into_sessions(statuses: Iterable[AgentStatus]) -> list[AgentS
     prompt. Fold it into the parent row instead -- carrying its mode up when it
     is the more actionable of the two, so the row cannot say Done while the work
     it delegated is still running. A subagent whose parent has already aged out
-    keeps its own row rather than vanishing.
+    keeps its own row rather than vanishing; one that died with its parent, or
+    went silent long ago, stops counting entirely.
     """
     ordered = list(statuses)
     parents = {
@@ -2968,6 +2970,8 @@ def roll_subagents_into_sessions(statuses: Iterable[AgentStatus]) -> list[AgentS
         if not is_subagent(status):
             continue
         parent = parents.get(status.session_id)
+        if not subagent_still_counts(status, parent):
+            continue
         if parent is None:
             orphans.append(status)
             continue

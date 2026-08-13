@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -61,6 +62,7 @@ from sidepulse.led_status import (
     ASK_AMBER,
     DONE_GREEN,
     FLEET_PULSE_MS,
+    FLEET_SUBAGENT_FRESH_SECONDS,
     WORKING_BLUE,
     CompletionAnnouncer,
     FleetBand,
@@ -4849,6 +4851,54 @@ class FleetDisplayTests(unittest.TestCase):
         )
         rows = roll_subagents_into_sessions([orphan])
         self.assertEqual([row.agent_id for row in rows], [orphan.agent_id])
+
+    def test_closing_a_session_retires_the_subagents_it_spawned(self) -> None:
+        # Subagents get no SessionEnd of their own, so without this the closed
+        # window's codebase keeps a Working band until the hour-long stale
+        # window expires.
+        closed = replace(
+            self._status("claude:session:aaa", AgentMode.IDLE_READY),
+            event_name="SessionEnd",
+        )
+        workers = [
+            self._subagent(
+                f"w{i}",
+                AgentMode.TOOL_RUNNING,
+                session_id=closed.session_id,
+                cwd="/tmp/wt",
+            )
+            for i in range(3)
+        ]
+
+        visible = fleet_visible_statuses([closed, *workers])
+        self.assertEqual([s.agent_id for s in visible], [closed.agent_id])
+        self.assertEqual(visible[0].mode, AgentMode.IDLE_READY)
+
+    def test_a_silent_subagent_stops_driving_its_parent_band(self) -> None:
+        now = datetime.now(timezone.utc)
+        parent = replace(
+            self._status("claude:session:aaa", AgentMode.COMPLETED),
+            updated_at=now - timedelta(seconds=60),
+        )
+        # A subagent that crashed without a SubagentStop still reports whatever
+        # it was doing at the time, forever.
+        dead = replace(
+            self._subagent(
+                "w0",
+                AgentMode.TOOL_RUNNING,
+                session_id=parent.session_id,
+                cwd="/tmp/wt",
+            ),
+            updated_at=now - timedelta(seconds=FLEET_SUBAGENT_FRESH_SECONDS + 60),
+        )
+
+        visible = fleet_visible_statuses([parent, dead], now=now)
+        self.assertEqual([s.mode for s in visible], [AgentMode.COMPLETED])
+
+        # A subagent inside the window still speaks for the codebase.
+        alive = replace(dead, updated_at=now - timedelta(seconds=60))
+        visible = fleet_visible_statuses([parent, alive], now=now)
+        self.assertEqual([s.mode for s in visible], [AgentMode.TOOL_RUNNING])
 
     def test_fleet_program_holds_without_repeat_when_nothing_animates(self) -> None:
         program = fleet_program([FleetBand(LedDisplayState.DONE, 1)])

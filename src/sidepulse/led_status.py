@@ -205,6 +205,10 @@ FLEET_MIN_STAGGER_WIDTH = 3
 # 20 minute Completed window: on a shared bar an old green crowds out the
 # agents still running. Safety net for sessions that die without a SessionEnd.
 FLEET_DONE_VISIBLE_SECONDS = 300.0
+# How long a silent subagent keeps driving its parent's slot. Long enough to sit
+# through a slow build without the band flickering out, short enough that a
+# crashed one does not hold a codebase lit for the full hour-long stale window.
+FLEET_SUBAGENT_FRESH_SECONDS = 1800.0
 FLEET_STATE_ORDER = (
     LedDisplayState.BLOCKED,
     LedDisplayState.ASK,
@@ -329,6 +333,26 @@ def is_subagent(status: AgentStatus) -> bool:
     return ":agent:" in (status.agent_id or "")
 
 
+def subagent_still_counts(
+    status: AgentStatus,
+    parent: AgentStatus | None,
+    *,
+    now: object = None,
+    fresh_seconds: float = FLEET_SUBAGENT_FRESH_SECONDS,
+) -> bool:
+    """Whether a subagent's work should still drive its parent's slot.
+
+    A subagent gets no SessionEnd of its own, so one that dies with its parent
+    -- or crashes outright -- keeps reporting whatever it was doing at the time
+    and holds a codebase lit for the full stale window. Two things retire it:
+    the parent session closing, since nothing it spawned outlives that, and
+    plain silence.
+    """
+    if parent is not None and parent.event_name == "SessionEnd":
+        return False
+    return fresh_seconds < 0 or status.age_seconds(now) <= fresh_seconds
+
+
 def fleet_slot_key(status: AgentStatus) -> str:
     """A fleet slot belongs to a codebase, not a session.
 
@@ -356,10 +380,10 @@ def fleet_visible_statuses(
     # A subagent works on behalf of a session, sometimes from its own worktree,
     # so its cwd can differ from the parent's. Roll it up to the parent's
     # codebase: its work belongs on that band rather than a band of its own.
-    parent_cwd = {
-        status.session_id: status.cwd
+    parents = {
+        status.session_id: status
         for status in ordered
-        if not is_subagent(status) and status.session_id and status.cwd
+        if not is_subagent(status) and status.session_id
     }
 
     best: dict[str, AgentStatus] = {}
@@ -372,7 +396,11 @@ def fleet_visible_statuses(
             continue
         key = fleet_slot_key(status)
         if is_subagent(status):
-            key = parent_cwd.get(status.session_id) or key
+            parent = parents.get(status.session_id)
+            if not subagent_still_counts(status, parent, now=now):
+                continue
+            if parent is not None and parent.cwd:
+                key = parent.cwd
         current = best.get(key)
         if current is None or (
             status.priority,
