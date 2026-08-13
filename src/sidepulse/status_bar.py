@@ -4,9 +4,10 @@ import json
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from typing import Iterable
 
 try:
     import objc
@@ -96,6 +97,7 @@ from .led_status import (
     fleet_program,
     fleet_bands_for_statuses,
     fleet_visible_statuses,
+    is_subagent,
     normalize_brightness,
     normalized_device_name,
     program_for_display_state,
@@ -2938,9 +2940,51 @@ def build_error_menu(exc: Exception) -> NSMenu:
 
 
 def recent_statuses(snapshot) -> list[AgentStatus]:
-    statuses = list(snapshot.statuses)
+    statuses = roll_subagents_into_sessions(snapshot.statuses)
     statuses.sort(key=lambda status: (status.priority, -status.updated_at.timestamp()))
     return statuses[:12]
+
+
+def roll_subagents_into_sessions(statuses: Iterable[AgentStatus]) -> list[AgentStatus]:
+    """One row per session, the way the fleet LEDs give one band per codebase.
+
+    A subagent has no window of its own to open and borrows its parent's title,
+    so listing it beside that parent reads as a second session stuck on an old
+    prompt. Fold it into the parent row instead -- carrying its mode up when it
+    is the more actionable of the two, so the row cannot say Done while the work
+    it delegated is still running. A subagent whose parent has already aged out
+    keeps its own row rather than vanishing.
+    """
+    ordered = list(statuses)
+    parents = {
+        status.session_id: status
+        for status in ordered
+        if not is_subagent(status) and status.session_id
+    }
+
+    rolled: dict[str, AgentStatus] = {}
+    orphans: list[AgentStatus] = []
+    for status in ordered:
+        if not is_subagent(status):
+            continue
+        parent = parents.get(status.session_id)
+        if parent is None:
+            orphans.append(status)
+            continue
+        current = rolled.get(status.session_id, parent)
+        if (status.priority, -status.updated_at.timestamp()) < (
+            current.priority,
+            -current.updated_at.timestamp(),
+        ):
+            rolled[status.session_id] = replace(
+                parent, mode=status.mode, updated_at=status.updated_at
+            )
+
+    return [
+        rolled.get(status.session_id, status)
+        for status in ordered
+        if not is_subagent(status)
+    ] + orphans
 
 
 def menu_title_for_status(status: AgentStatus, now: datetime) -> str:

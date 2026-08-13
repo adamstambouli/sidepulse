@@ -1081,6 +1081,13 @@ def mode_for_event(record: HookEvent) -> AgentMode | None:
 
 def explicit_mode_for_record(record: HookEvent) -> AgentMode | None:
     raw = record.raw
+    if record.agent_id:
+        # A marker is a message to whoever reads the reply, and a subagent's
+        # reply goes to the session that spawned it -- never to a person. That
+        # session is still running and will post its own marker when it stops,
+        # so honouring the subagent's would strand an Ask nobody can answer.
+        return None
+
     for key in ("sidepulse_status", "sidepulse_mode", "sidepulse_status", "sidepulse_mode"):
         mode = explicit_mode_from_value(raw.get(key))
         if mode is not None:

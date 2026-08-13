@@ -4125,6 +4125,38 @@ class AgentMonitorTests(unittest.TestCase):
 
             self.assertEqual(snapshot.aggregate.mode, AgentMode.WAITING_FOR_INPUT)
 
+    def test_ask_marker_from_a_subagent_is_not_an_ask(self) -> None:
+        # A subagent's reply goes to the session that spawned it, not to a
+        # person, and that session is still running. Honouring its marker
+        # strands an amber Ask nobody can answer.
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "claude.jsonl"
+            log.write_text(
+                json.dumps(
+                    {
+                        "logged_at": datetime.now(timezone.utc)
+                        .strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "hook_event_name": "SubagentStop",
+                        "session_id": "claude-session",
+                        "agent_id": "a8e525538822ad73d",
+                        "last_assistant_message": (
+                            "Grant it Full Disk Access, then tell me and I'll "
+                            "run the test.\n<!-- sidepulse:ask -->"
+                        ),
+                    }
+                )
+                + "\n"
+            )
+
+            monitor = AgentMonitor(
+                sources=(SourceSpec("claude", log),),
+                stale_after_seconds=999999999,
+                tool_running_timeout_seconds=0,
+            )
+            snapshot = monitor.snapshot()
+
+            self.assertEqual(snapshot.aggregate.mode, AgentMode.COMPLETED)
+
     def test_permission_request_still_maps_to_waiting_for_input(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "codex.jsonl"
@@ -4780,6 +4812,43 @@ class FleetDisplayTests(unittest.TestCase):
             for i in range(6)
         ]
         self.assertEqual(len(fleet_visible_statuses(statuses)), 2)
+
+    def test_menu_folds_subagents_into_their_parent_row(self) -> None:
+        # A subagent borrows its parent's title, so listing it beside that
+        # parent reads as a second session stuck on an older prompt.
+        try:
+            from sidepulse.status_bar import roll_subagents_into_sessions
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        parent = self._status("claude:session:aaa", AgentMode.COMPLETED)
+        workers = [
+            self._subagent(
+                f"w{i}",
+                AgentMode.TOOL_RUNNING,
+                session_id=parent.session_id,
+                cwd="/tmp/wt",
+            )
+            for i in range(3)
+        ]
+
+        rows = roll_subagents_into_sessions([parent, *workers])
+        self.assertEqual([row.agent_id for row in rows], [parent.agent_id])
+        # The row cannot claim Done while the work it delegated is still running.
+        self.assertEqual(rows[0].mode, AgentMode.TOOL_RUNNING)
+        self.assertEqual(rows[0].display_name, parent.display_name)
+
+    def test_menu_keeps_a_subagent_whose_parent_is_gone(self) -> None:
+        try:
+            from sidepulse.status_bar import roll_subagents_into_sessions
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        orphan = self._subagent(
+            "w0", AgentMode.WORKING, session_id="vanished", cwd="/tmp/wt"
+        )
+        rows = roll_subagents_into_sessions([orphan])
+        self.assertEqual([row.agent_id for row in rows], [orphan.agent_id])
 
     def test_fleet_program_holds_without_repeat_when_nothing_animates(self) -> None:
         program = fleet_program([FleetBand(LedDisplayState.DONE, 1)])

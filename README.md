@@ -25,6 +25,11 @@ every agent is in the same state. Slots are sticky per codebase, so an agent
 finishing never shuffles its neighbors, and multiple sessions in one directory
 collapse into one band.
 
+Subagents never claim a band or a menu row of their own — three real sessions
+would otherwise present as eight — but their work still drives the parent's
+band, so a session that has handed off to subagents reads as Working instead of
+going dark.
+
 Turn it on from the device submenu in the menu bar, or:
 
 ```sh
@@ -63,7 +68,10 @@ adjacent hues and read as the same color on a diffused LED.
   against phrases like "want me to…" and lit Ask on finished turns. A `Stop`
   means the agent yielded its turn voluntarily, so nothing is blocked — a real
   block arrives as `PermissionRequest` or `Notification` instead. An explicit
-  `<!-- sidepulse:ask -->` marker still wins.
+  `<!-- sidepulse:ask -->` marker still wins — except from a subagent, whose
+  reply goes to the session that spawned it rather than to a person. Since that
+  session is still running and posts its own marker when it stops, honouring the
+  subagent's would strand an amber Ask nobody can answer.
 - `SessionEnd` releases the LEDs immediately instead of holding a Done band for
   the full Completed window, so closing a session frees its share of the bar.
 - Blocked/Error is its own state, separate from Waiting-for-Input, in the LEDs,
